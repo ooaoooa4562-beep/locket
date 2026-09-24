@@ -1,29 +1,17 @@
-db.py — работа с базой данных SQLite.
-Асинхронно через aiosqlite. Без ORM — чистый SQL, чтобы было понятно.
-"""
+# db.py - работа с SQLite. Асинхронно через aiosqlite. Без ORM.
 
 import aiosqlite
 import os
 from pathlib import Path
 from datetime import datetime, timezone
 
-# Путь к БД берём из .env, по умолчанию — ./data/vault.db
 DB_PATH = os.getenv("DATABASE_PATH", "./data/vault.db")
-
-# Создаём папку data, если её нет
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 
-# === Инициализация схемы ===
-
 async def init_db() -> None:
-    """
-    Создаёт таблицы, если их нет.
-    Вызывается один раз при старте бота.
-    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
-        -- Пользователи
         CREATE TABLE IF NOT EXISTS users (
             user_id         INTEGER PRIMARY KEY,
             username        TEXT,
@@ -36,7 +24,6 @@ async def init_db() -> None:
             last_login_at   TEXT
         );
 
-        -- Сохранённые элементы Vault
         CREATE TABLE IF NOT EXISTS items (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id      INTEGER NOT NULL,
@@ -51,7 +38,6 @@ async def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_items_user_created
             ON items(user_id, created_at DESC);
 
-        -- Попытки авторизации (для rate limiting)
         CREATE TABLE IF NOT EXISTS attempts (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id      INTEGER NOT NULL,
@@ -66,10 +52,7 @@ async def init_db() -> None:
         await db.commit()
 
 
-# === Пользователи ===
-
 async def get_user(user_id: int) -> dict | None:
-    """Возвращает пользователя или None."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -80,7 +63,6 @@ async def get_user(user_id: int) -> dict | None:
 
 
 async def create_user(user_id: int, username: str | None) -> None:
-    """Регистрирует нового пользователя."""
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -92,7 +74,6 @@ async def create_user(user_id: int, username: str | None) -> None:
 
 
 async def set_password(user_id: int, password_hash: str, salt: str) -> None:
-    """Сохраняет хеш мастер-пароля и соль."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET password_hash = ?, password_salt = ? WHERE user_id = ?",
@@ -102,7 +83,6 @@ async def set_password(user_id: int, password_hash: str, salt: str) -> None:
 
 
 async def set_totp_secret(user_id: int, secret_enc: str, iv: str) -> None:
-    """Сохраняет зашифрованный TOTP-секрет."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET totp_secret_enc = ?, totp_secret_iv = ?, totp_enabled = 1 "
@@ -113,7 +93,6 @@ async def set_totp_secret(user_id: int, secret_enc: str, iv: str) -> None:
 
 
 async def update_last_login(user_id: int) -> None:
-    """Обновляет время последнего входа."""
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -121,15 +100,15 @@ async def update_last_login(user_id: int) -> None:
             (now, user_id),
         )
         await db.commit()
-# === Элементы Vault ===
-[24.09.2026 19:50] Komick Op: async def save_item(
+
+
+async def save_item(
     user_id: int,
     content_type: str,
     content_enc: str,
     content_iv: str,
     preview: str | None = None,
 ) -> int:
-    """Сохраняет зашифрованный элемент. Возвращает id."""
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -147,7 +126,6 @@ async def get_items(
     limit: int = 20,
     offset: int = 0,
 ) -> list[dict]:
-    """Возвращает элементы пользователя, опционально по типу."""
     query = "SELECT id, content_type, preview, created_at FROM items WHERE user_id = ?"
     params: list = [user_id]
     if content_type:
@@ -164,7 +142,6 @@ async def get_items(
 
 
 async def get_item(item_id: int, user_id: int) -> dict | None:
-    """Возвращает один элемент (с зашифрованным содержимым) или None."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -175,10 +152,7 @@ async def get_item(item_id: int, user_id: int) -> dict | None:
             return dict(row) if row else None
 
 
-# === Rate limiting ===
-
 async def log_attempt(user_id: int, attempt_type: str, success: bool) -> None:
-    """Логирует попытку авторизации (без значений пароля/кода!)."""
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -190,7 +164,6 @@ async def log_attempt(user_id: int, attempt_type: str, success: bool) -> None:
 
 
 async def count_failed_attempts(user_id: int, attempt_type: str, since_iso: str) -> int:
-    """Считает неудачные попытки с указанного времени."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT COUNT(*) FROM attempts "
