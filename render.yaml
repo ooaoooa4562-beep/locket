@@ -1,0 +1,37 @@
+# render.yaml — конфигурация для Render Blueprint.
+# Render автоматически прочитает этот файл и создаст сервис.
+
+services:
+  - type: web
+    name: locket
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DATABASE_PATH
+        value: /opt/render/project/src/data/vault.db
+      - key: VAULT_SESSION_TTL
+        value: "15"
+      - key: MAX_PASSWORD_ATTEMPTS
+        value: "3"
+      - key: MAX_TOTP_ATTEMPTS
+        value: "3"
+      - key: LOCKOUT_MINUTES
+        value: "5"
+      - key: MAX_TOTAL_ATTEMPTS
+        value: "10"
+      - key: LOCKOUT_LONG_HOURS
+        value: "24"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: 3.11.9
