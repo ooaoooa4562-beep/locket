@@ -1,6 +1,9 @@
 # handlers.py - вся логика бота.
+# Обновлено: удаление сообщений пользователя после сохранения,
+# отправка медиа по категориям с автоудалением через 60 секунд.
 
 import os
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -24,6 +27,8 @@ MAX_TOTP_ATTEMPTS = int(os.getenv("MAX_TOTP_ATTEMPTS", "3"))
 LOCKOUT_MINUTES = int(os.getenv("LOCKOUT_MINUTES", "5"))
 MAX_TOTAL_ATTEMPTS = int(os.getenv("MAX_TOTAL_ATTEMPTS", "10"))
 LOCKOUT_LONG_HOURS = int(os.getenv("LOCKOUT_LONG_HOURS", "24"))
+
+MEDIA_AUTODELETE_SECONDS = int(os.getenv("MEDIA_AUTODELETE_SECONDS", "60"))
 
 
 class Auth(StatesGroup):
@@ -413,6 +418,10 @@ def _detect_type(message: Message) -> str | None:
 
 
 async def save_content(message: Message, state: FSMContext) -> None:
+    """
+    Сохраняет контент, удаляет исходное сообщение пользователя.
+    Работает только при разблокированном Vault.
+    """
     user_id = message.from_user.id
 
     if message.text and message.text.startswith("/"):
@@ -433,7 +442,6 @@ async def save_content(message: Message, state: FSMContext) -> None:
 
     content_type = _detect_type(message)
     if not content_type:
-        await message.answer("🤷 Не понял, что это. Поддерживаются: текст, фото, видео, документы, аудио, ссылки.")
         return
 
     if content_type in ("text", "link"):
@@ -476,10 +484,83 @@ async def save_content(message: Message, state: FSMContext) -> None:
         "video": "🎥", "document": "📄", "audio": "🎵",
     }.get(content_type, "✅")
 
-    await message.answer(f"{emoji} Сохранено. Открыть: /vault")
+    # Удаляем сообщение пользователя
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Отправляем короткое подтверждение и удаляем через 3 секунды
+    confirm = await message.answer(f"{emoji} Сохранено.")
+    await asyncio.sleep(3)
+    try:
+        await confirm.delete()
+    except Exception:
+        pass
+
+
+async def _send_media_items(message: Message, user_id: int, content_type: str) -> None:
+    """
+    Отправляет все фото/видео пользователя.
+    Через MEDIA_AUTODELETE_SECONDS секунд удаляет всё, что отправил.
+    """
+    items = await db.get_items(user_id, content_type=content_type, limit=20)
+
+    if not items:
+        await message.answer("📭 Пусто.")
+        return
+
+    data_key = _sessions[user_id]["data_key"]
+
+    sent_messages = []
+
+    header = await message.answer(
+        f"📤 Отправляю {len(items)} шт. Удалю через {MEDIA_AUTODELETE_SECONDS} секунд."
+    )
+    sent_messages.append(header)
+
+    for it in items:
+        full = await db.get_item(it["id"], user_id)
+        if not full:
+            continue
+
+        try:
+            raw = crypto.decrypt(data_key, full["content_enc"], full["content_iv"])
+        except Exception:
+            logger.warning("Failed to decrypt item %s", it["id"])
+            continue
+
+        if not raw.startswith("file_id:"):
+            continue
+        file_id = raw.split(":", 1)[1]
+
+        try:
+            if content_type == "photo":
+                sent = await message.answer_photo(file_id)
+            elif content_type == "video":
+                sent = await message.answer_video(file_id)
+            else:
+                continue
+            sent_messages.append(sent)
+        except Exception as e:
+            logger.warning("Failed to send file_id: %s", e)
+
+    # Ждём N секунд и удаляем всё
+    await asyncio.sleep(MEDIA_AUTODELETE_SECONDS)
+
+    for m in sent_messages:
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 
 async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
+    """
+    Показывает элементы по категории.
+    Для photo/video - отправляет сами файлы с автоудалением.
+    Для остальных - показывает список.
+    """
     user_id = callback.from_user.id
     if not _is_unlocked(user_id):
         await callback.answer("🔒 Vault заблокирован", show_alert=True)
@@ -488,6 +569,12 @@ async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
     _touch(user_id)
     cat = callback.data.split(":", 1)[1]
     content_type = None if cat == "all" else cat
+
+    await callback.answer()
+
+    if cat in ("photo", "video"):
+        await _send_media_items(callback.message, user_id, cat)
+        return
 
     items = await db.get_items(user_id, content_type=content_type, limit=20)
 
@@ -505,7 +592,6 @@ async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
             lines.append(f"{emoji} <code>#{it['id']}</code> {dt}\n{preview}")
         text = "\n\n".join(lines)
 
-    await callback.answer()
     await callback.message.edit_text(
         text,
         reply_markup=categories_kb(),
@@ -556,7 +642,8 @@ async def cb_settings(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\n\n"
         f"⏱ Время сессии: {SESSION_TTL} мин.\n"
-        f"🔑 2FA: включена\n\n"
+        f"🔑 2FA: включена\n"
+        f"⏳ Автоудаление медиа: {MEDIA_AUTODELETE_SECONDS} сек.\n\n"
         "Смена пароля и другие настройки - в следующих версиях.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
