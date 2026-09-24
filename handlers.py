@@ -1,19 +1,4 @@
-"""
-handlers.py — вся логика бота.
-
-Что внутри:
-- /start — регистрация, настройка пароля и 2FA.
-- /vault — открытие хранилища (с авторизацией).
-- /lock — мгновенная блокировка.
-- Приём и сохранение контента.
-- Просмотр, категории, поиск.
-- Rate limiting и логирование попыток.
-
-Безопасность:
-- Пароль и код никогда не логируются.
-- Сообщения с паролем и кодом удаляются сразу после обработки.
-- Ошибки авторизации не раскрывают существование данных.
-"""
+# handlers.py - вся логика бота.
 
 import os
 import logging
@@ -31,21 +16,15 @@ from aiogram.fsm.state import State, StatesGroup
 import db
 import crypto
 
-
 logger = logging.getLogger("locket.handlers")
 
-
-# === Настройки из окружения ===
-
-SESSION_TTL = int(os.getenv("VAULT_SESSION_TTL", "15"))  # минут
+SESSION_TTL = int(os.getenv("VAULT_SESSION_TTL", "15"))
 MAX_PW_ATTEMPTS = int(os.getenv("MAX_PASSWORD_ATTEMPTS", "3"))
 MAX_TOTP_ATTEMPTS = int(os.getenv("MAX_TOTP_ATTEMPTS", "3"))
 LOCKOUT_MINUTES = int(os.getenv("LOCKOUT_MINUTES", "5"))
 MAX_TOTAL_ATTEMPTS = int(os.getenv("MAX_TOTAL_ATTEMPTS", "10"))
 LOCKOUT_LONG_HOURS = int(os.getenv("LOCKOUT_LONG_HOURS", "24"))
 
-
-# === Состояния FSM ===
 
 class Auth(StatesGroup):
     waiting_new_password = State()
@@ -56,13 +35,10 @@ class Auth(StatesGroup):
     waiting_search = State()
 
 
-# === In-memory сессии разблокировки ===
-# user_id -> {expires_at, data_key}
 _sessions: dict[int, dict] = {}
 
 
 def _is_unlocked(user_id: int) -> bool:
-    """Проверяет, разблокирован ли Vault у пользователя."""
     s = _sessions.get(user_id)
     if not s:
         return False
@@ -73,7 +49,6 @@ def _is_unlocked(user_id: int) -> bool:
 
 
 def _unlock(user_id: int, data_key: bytes) -> None:
-    """Разблокирует Vault на SESSION_TTL минут."""
     _sessions[user_id] = {
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=SESSION_TTL),
         "data_key": data_key,
@@ -81,7 +56,6 @@ def _unlock(user_id: int, data_key: bytes) -> None:
 
 
 def _lock(user_id: int) -> None:
-    """Стирает ключ из памяти и блокирует Vault."""
     if user_id in _sessions:
         s = _sessions.pop(user_id)
         try:
@@ -91,14 +65,11 @@ def _lock(user_id: int) -> None:
 
 
 def _touch(user_id: int) -> None:
-    """Продлевает сессию при активности."""
     if user_id in _sessions:
         _sessions[user_id]["expires_at"] = (
             datetime.now(timezone.utc) + timedelta(minutes=SESSION_TTL)
         )
 
-
-# === Клавиатуры ===
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -133,10 +104,7 @@ def locked_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# === Rate limiting ===
-
 async def check_lockout(user_id: int, attempt_type: str) -> tuple[bool, str]:
-    """Асинхронная проверка блокировки."""
     now = datetime.now(timezone.utc)
 
     since_short = (now - timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
@@ -153,10 +121,7 @@ async def check_lockout(user_id: int, attempt_type: str) -> tuple[bool, str]:
     return False, ""
 
 
-# === /start ===
-
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    """/start — регистрация или приветствие."""
     await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username
@@ -166,9 +131,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await db.create_user(user_id, username)
         logger.info("New user registered: %s", user_id)
         await message.answer(
-            "🔐 <b>Locket</b> — твоё защищённое хранилище.\n\n"
+            "🔐 <b>Locket</b> - твоё защищённое хранилище.\n\n"
             "Придумай <b>мастер-пароль</b>. Он будет использоваться для входа в Vault.\n"
-            "⚠️ Запомни его — восстановить нельзя.\n\n"
+            "⚠️ Запомни его - восстановить нельзя.\n\n"
             "Отправь пароль (минимум 8 символов)."
         )
         await state.set_state(Auth.waiting_new_password)
@@ -176,20 +141,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
     if user.get("password_hash"):
         await message.answer(
-            "🔐 <b>Locket</b>\n\nVault создан. Для доступа — /vault.",
+            "🔐 <b>Locket</b>\n\nVault создан. Для доступа - /vault.",
             reply_markup=locked_kb(),
         )
     else:
-        await message.answer(
-            "🔐 Придумай <b>мастер-пароль</b> (минимум 8 символов)."
-        )
+        await message.answer("🔐 Придумай <b>мастер-пароль</b> (минимум 8 символов).")
         await state.set_state(Auth.waiting_new_password)
 
 
-# === Установка пароля ===
-
 async def set_new_password(message: Message, state: FSMContext) -> None:
-    """Первый ввод пароля."""
     password = message.text or ""
     try:
         await message.delete()
@@ -206,7 +166,6 @@ async def set_new_password(message: Message, state: FSMContext) -> None:
 
 
 async def confirm_password(message: Message, state: FSMContext) -> None:
-    """Подтверждение пароля и настройка 2FA."""
     password = message.text or ""
     try:
         await message.delete()
@@ -246,7 +205,6 @@ async def confirm_password(message: Message, state: FSMContext) -> None:
 
 
 async def verify_totp_setup(message: Message, state: FSMContext) -> None:
-    """Проверка кода при настройке 2FA."""
     code = (message.text or "").strip()
     try:
         await message.delete()
@@ -269,16 +227,13 @@ async def verify_totp_setup(message: Message, state: FSMContext) -> None:
     logger.info("User %s completed setup", message.from_user.id)
     await message.answer(
         "🎉 <b>Vault готов!</b>\n\n"
-        "Теперь можно отправлять мне сообщения, фото, видео, документы и ссылки — "
+        "Теперь можно отправлять мне сообщения, фото, видео, документы и ссылки - "
         "я сохраню их в защищённое хранилище.\n\n"
-        "Для просмотра — /vault."
+        "Для просмотра - /vault."
     )
 
 
-# === /vault ===
-
 async def cmd_vault(message: Message, state: FSMContext) -> None:
-    """/vault — открыть хранилище."""
     await state.clear()
     user_id = message.from_user.id
     user = await db.get_user(user_id)
@@ -301,14 +256,12 @@ async def cmd_vault(message: Message, state: FSMContext) -> None:
 
 
 async def cb_unlock(callback: CallbackQuery, state: FSMContext) -> None:
-    """Кнопка «Разблокировать»."""
     await callback.answer()
     await callback.message.answer("🔐 Введи мастер-пароль:")
     await state.set_state(Auth.waiting_password)
 
 
 async def cb_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    """Возврат в главное меню."""
     await callback.answer()
     if not _is_unlocked(callback.from_user.id):
         await callback.message.edit_text(
@@ -323,10 +276,7 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-# === Ввод пароля при входе ===
-
 async def enter_password(message: Message, state: FSMContext) -> None:
-    """Проверка мастер-пароля."""
     user_id = message.from_user.id
     password = message.text or ""
 
@@ -373,7 +323,6 @@ async def enter_password(message: Message, state: FSMContext) -> None:
 
 
 async def enter_totp(message: Message, state: FSMContext) -> None:
-    """Проверка TOTP-кода."""
     user_id = message.from_user.id
     code = (message.text or "").strip()
 
@@ -429,8 +378,6 @@ async def enter_totp(message: Message, state: FSMContext) -> None:
     )
 
 
-# === /lock ===
-
 async def cmd_lock(message: Message, state: FSMContext) -> None:
     await state.clear()
     _lock(message.from_user.id)
@@ -446,10 +393,7 @@ async def cb_lock(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-# === Сохранение контента ===
-
 def _detect_type(message: Message) -> str | None:
-    """Определяет тип контента."""
     if message.photo:
         return "photo"
     if message.video:
@@ -469,7 +413,6 @@ def _detect_type(message: Message) -> str | None:
 
 
 async def save_content(message: Message, state: FSMContext) -> None:
-    """Сохраняет любой контент. Требует разблокированного Vault."""
     user_id = message.from_user.id
 
     if message.text and message.text.startswith("/"):
@@ -536,10 +479,7 @@ async def save_content(message: Message, state: FSMContext) -> None:
     await message.answer(f"{emoji} Сохранено. Открыть: /vault")
 
 
-# === Просмотр и категории ===
-
 async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
-    """Показывает элементы по категории."""
     user_id = callback.from_user.id
     if not _is_unlocked(user_id):
         await callback.answer("🔒 Vault заблокирован", show_alert=True)
@@ -572,10 +512,7 @@ async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-# === Поиск ===
-
 async def cb_search(callback: CallbackQuery, state: FSMContext) -> None:
-    """Кнопка «Поиск» — просит запрос."""
     user_id = callback.from_user.id
     if not _is_unlocked(user_id):
         await callback.answer("🔒 Vault заблокирован", show_alert=True)
@@ -587,7 +524,6 @@ async def cb_search(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def do_search(message: Message, state: FSMContext) -> None:
-    """Поиск по превью."""
     user_id = message.from_user.id
     if not _is_unlocked(user_id):
         await message.answer("🔒 Vault заблокирован. /vault")
@@ -615,25 +551,20 @@ async def do_search(message: Message, state: FSMContext) -> None:
     await state.clear()
 
 
-# === Настройки ===
-
 async def cb_settings(callback: CallbackQuery) -> None:
     await callback.answer()
     await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\n\n"
         f"⏱ Время сессии: {SESSION_TTL} мин.\n"
         f"🔑 2FA: включена\n\n"
-        "Смена пароля и другие настройки — в следующих версиях.",
+        "Смена пароля и другие настройки - в следующих версиях.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
         ]),
     )
 
 
-# === Регистрация хендлеров ===
-
 def register_handlers(dp: Dispatcher) -> None:
-    """Регистрирует все хендлеры. Вызывается из main.py."""
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_vault, Command("vault"))
     dp.message.register(cmd_lock, Command("lock"))
