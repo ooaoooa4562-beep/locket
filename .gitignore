@@ -1,0 +1,33 @@
+# === Секреты ===
+.env
+.env.*
+!.env.example
+
+# === База данных ===
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# === Python ===
+pycache/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# === IDE ===
+.idea/
+.vscode/
+*.swp
+
+# === Логи ===
+*.log
+logs/
+
+# === OS ===
+.DS_Store
+Thumbs.db
