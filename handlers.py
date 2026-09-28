@@ -645,4 +645,52 @@ async def do_search(message: Message, state: FSMContext) -> None:
         return
 
     items = await db.get_items(user_id, content_type=None, limit=200)
-    found = [it for it in items if query in (it["preview"] or "").
+    found = [it for it in items if query in (it["preview"] or "").lower()]
+
+    if not found:
+        await message.answer("📭 Ничего не найдено.")
+    else:
+        lines = ["<b>🔎 Результаты:</b>\n"]
+        for it in found[:20]:
+            dt = it["created_at"][:16].replace("T", " ")
+            preview = (it["preview"] or "")[:60]
+            lines.append(f"<code>#{it['id']}</code> {dt}\n{preview}")
+        await message.answer("\n\n".join(lines))
+
+    await state.clear()
+
+
+async def cb_settings(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки</b>\n\n"
+        f"⏱ Время сессии: {SESSION_TTL} мин.\n"
+        f"🔑 2FA: recovery-код (10 символов)\n"
+        f"⏳ Автоудаление медиа: {MEDIA_AUTODELETE_SECONDS} сек.\n\n"
+        "Смена пароля - в следующих версиях.",
+        reply_markup=settings_kb(),
+    )
+
+
+def register_handlers(dp: Dispatcher) -> None:
+    dp.message.register(cmd_start, Command("start"))
+    dp.message.register(cmd_vault, Command("vault"))
+    dp.message.register(cmd_lock, Command("lock"))
+    dp.message.register(cmd_revoke, Command("revoke"))
+
+    dp.callback_query.register(cb_unlock, F.data == "unlock")
+    dp.callback_query.register(cb_menu, F.data == "menu")
+    dp.callback_query.register(cb_lock, F.data == "lock")
+    dp.callback_query.register(cb_settings, F.data == "settings")
+    dp.callback_query.register(cb_search, F.data == "search")
+    dp.callback_query.register(cb_category, F.data.startswith("cat:"))
+    dp.callback_query.register(cb_revoke, F.data == "revoke")
+
+    dp.message.register(confirm_password, Auth.waiting_confirm_password)
+    dp.message.register(set_new_password, Auth.waiting_new_password)
+    dp.message.register(verify_code_setup, Auth.waiting_code_setup)
+    dp.message.register(enter_code, Auth.waiting_code)
+    dp.message.register(enter_password, Auth.waiting_password)
+    dp.message.register(do_search, Auth.waiting_search)
+
+    dp.message.register(save_content)
