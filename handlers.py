@@ -1,6 +1,6 @@
 # handlers.py - вся логика бота.
-# Обновлено: удаление сообщений пользователя после сохранения,
-# отправка медиа по категориям с автоудалением через 60 секунд.
+# 2FA через 10-символьный recovery-код (вместо TOTP).
+# Есть отзыв и выдача нового кода.
 
 import os
 import asyncio
@@ -23,7 +23,7 @@ logger = logging.getLogger("locket.handlers")
 
 SESSION_TTL = int(os.getenv("VAULT_SESSION_TTL", "15"))
 MAX_PW_ATTEMPTS = int(os.getenv("MAX_PASSWORD_ATTEMPTS", "3"))
-MAX_TOTP_ATTEMPTS = int(os.getenv("MAX_TOTP_ATTEMPTS", "3"))
+MAX_CODE_ATTEMPTS = int(os.getenv("MAX_CODE_ATTEMPTS", "3"))
 LOCKOUT_MINUTES = int(os.getenv("LOCKOUT_MINUTES", "5"))
 MAX_TOTAL_ATTEMPTS = int(os.getenv("MAX_TOTAL_ATTEMPTS", "10"))
 LOCKOUT_LONG_HOURS = int(os.getenv("LOCKOUT_LONG_HOURS", "24"))
@@ -34,9 +34,9 @@ MEDIA_AUTODELETE_SECONDS = int(os.getenv("MEDIA_AUTODELETE_SECONDS", "60"))
 class Auth(StatesGroup):
     waiting_new_password = State()
     waiting_confirm_password = State()
-    waiting_totp_setup = State()
+    waiting_code_setup = State()
     waiting_password = State()
-    waiting_totp = State()
+    waiting_code = State()
     waiting_search = State()
 
 
@@ -109,11 +109,18 @@ def locked_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def settings_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сменить recovery-код", callback_data="revoke")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
+    ])
+
+
 async def check_lockout(user_id: int, attempt_type: str) -> tuple[bool, str]:
     now = datetime.now(timezone.utc)
 
     since_short = (now - timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
-    max_att = MAX_TOTP_ATTEMPTS if attempt_type == "totp" else MAX_PW_ATTEMPTS
+    max_att = MAX_CODE_ATTEMPTS if attempt_type == "code" else MAX_PW_ATTEMPTS
     fails_short = await db.count_failed_attempts(user_id, attempt_type, since_short)
     if fails_short >= max_att:
         return True, f"⏳ Слишком много попыток. Подожди {LOCKOUT_MINUTES} мин."
@@ -189,42 +196,42 @@ async def confirm_password(message: Message, state: FSMContext) -> None:
     pw_hash = crypto.hash_password(password, salt)
     await db.set_password(user_id, pw_hash, salt)
 
-    totp_secret = crypto.generate_totp_secret()
+    # Генерируем recovery-код
+    code = crypto.generate_recovery_code()
+    code_salt = crypto.generate_salt()
+    code_hash = crypto.hash_recovery_code(code, code_salt)
+    await db.set_recovery_code(user_id, code_hash, code_salt)
 
-    master_key = crypto.derive_key(password, salt)
-    secret_enc, secret_iv = crypto.encrypt(master_key, totp_secret)
-    await db.set_totp_secret(user_id, secret_enc, secret_iv)
-
-    uri = crypto.get_totp_uri(totp_secret, user_id)
     await message.answer(
         "✅ Пароль сохранён.\n\n"
-        "🔑 <b>Настройка 2FA</b>\n\n"
-        "Добавь этот секрет в Google Authenticator / Authy / 1Password:\n\n"
-        f"<code>{totp_secret}</code>\n\n"
-        "Или используй ссылку (скопируй и открой в приложении):\n"
-        f"<code>{uri}</code>\n\n"
-        "После добавления отправь <b>6-значный код</b> из приложения для подтверждения."
+        "🔑 <b>Твой recovery-код</b>\n\n"
+        f"<code>{code}</code>\n\n"
+        "⚠️ <b>Сохрани его сейчас.</b> Показывается <b>один раз</b>.\n"
+        "Он понадобится для входа вместе с паролем.\n\n"
+        "Если потеряешь - сможешь отозвать и получить новый (через /settings).\n\n"
+        "Введи код ещё раз для подтверждения:"
     )
-    await state.update_data(temp_secret=totp_secret)
-    await state.set_state(Auth.waiting_totp_setup)
+    await state.update_data(temp_code=code)
+    await state.set_state(Auth.waiting_code_setup)
 
 
-async def verify_totp_setup(message: Message, state: FSMContext) -> None:
-    code = (message.text or "").strip()
+async def verify_code_setup(message: Message, state: FSMContext) -> None:
+    code_input = (message.text or "").strip()
     try:
         await message.delete()
     except Exception:
         pass
 
     data = await state.get_data()
-    secret = data.get("temp_secret")
-    if not secret:
+    expected = data.get("temp_code")
+
+    if not expected:
         await message.answer("❌ Что-то пошло не так. Начни заново: /start")
         await state.clear()
         return
 
-    if not crypto.verify_totp(secret, code):
-        await message.answer("❌ Неверный код. Попробуй ещё раз.")
+    if crypto.normalize_recovery_code(code_input) != crypto.normalize_recovery_code(expected):
+        await message.answer("❌ Код не совпадает. Попробуй ещё раз.")
         return
 
     await state.clear()
@@ -311,32 +318,21 @@ async def enter_password(message: Message, state: FSMContext) -> None:
         return
 
     master_key = crypto.derive_key(password, user["password_salt"])
-
-    if user.get("totp_enabled"):
-        await state.update_data(temp_master_key=master_key.hex())
-        await message.answer("🔑 Введи 6-значный код из приложения:")
-        await state.set_state(Auth.waiting_totp)
-    else:
-        data_key = crypto.derive_data_key(master_key)
-        _unlock(user_id, data_key)
-        await db.update_last_login(user_id)
-        await state.clear()
-        await message.answer(
-            "🔓 <b>Vault разблокирован</b>",
-            reply_markup=main_menu_kb(),
-        )
+    await state.update_data(temp_master_key=master_key.hex())
+    await message.answer("🔑 Введи recovery-код:")
+    await state.set_state(Auth.waiting_code)
 
 
-async def enter_totp(message: Message, state: FSMContext) -> None:
+async def enter_code(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
-    code = (message.text or "").strip()
+    code_input = (message.text or "").strip()
 
     try:
         await message.delete()
     except Exception:
         pass
 
-    locked, lock_msg = await check_lockout(user_id, "totp")
+    locked, lock_msg = await check_lockout(user_id, "code")
     if locked:
         await message.answer(lock_msg)
         await state.clear()
@@ -351,28 +347,24 @@ async def enter_totp(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    master_key = bytes.fromhex(master_key_hex)
-
-    try:
-        totp_secret = crypto.decrypt(
-            master_key,
-            user["totp_secret_enc"],
-            user["totp_secret_iv"],
-        )
-    except Exception:
-        logger.error("Failed to decrypt TOTP secret for user %s", user_id)
-        await message.answer("❌ Ошибка. Попробуй заново: /vault")
+    if not user.get("recovery_code_hash") or not user.get("recovery_code_salt"):
+        await message.answer("❌ Код не настроен. Обратись к /start")
         await state.clear()
         return
 
-    ok = crypto.verify_totp(totp_secret, code)
-    await db.log_attempt(user_id, "totp", ok)
+    ok = crypto.verify_recovery_code(
+        code_input,
+        user["recovery_code_salt"],
+        user["recovery_code_hash"],
+    )
+    await db.log_attempt(user_id, "code", ok)
 
     if not ok:
-        logger.warning("Failed TOTP attempt for user %s", user_id)
+        logger.warning("Failed code attempt for user %s", user_id)
         await message.answer("❌ Неверный код. Попробуй ещё раз.")
         return
 
+    master_key = bytes.fromhex(master_key_hex)
     data_key = crypto.derive_data_key(master_key)
     _unlock(user_id, data_key)
     await db.update_last_login(user_id)
@@ -398,6 +390,53 @@ async def cb_lock(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+# === Отзыв recovery-кода ===
+
+async def cb_revoke(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отзывает старый код и выдаёт новый."""
+    user_id = callback.from_user.id
+    if not _is_unlocked(user_id):
+        await callback.answer("🔒 Vault заблокирован", show_alert=True)
+        return
+
+    await callback.answer()
+
+    new_code = crypto.generate_recovery_code()
+    new_salt = crypto.generate_salt()
+    new_hash = crypto.hash_recovery_code(new_code, new_salt)
+    await db.set_recovery_code(user_id, new_hash, new_salt)
+
+    # Сбрасываем все сессии (кроме текущей — оставим разблокированной)
+    logger.info("Recovery code revoked for user %s", user_id)
+
+    await callback.message.answer(
+        "🔄 <b>Recovery-код обновлён</b>\n\n"
+        f"<code>{new_code}</code>\n\n"
+        "⚠️ Сохрани его. Показывается <b>один раз</b>.\n"
+        "Старый код больше не работает."
+    )
+
+
+async def cmd_revoke(message: Message, state: FSMContext) -> None:
+    """Команда /revoke."""
+    user_id = message.from_user.id
+    if not _is_unlocked(user_id):
+        await message.answer("🔒 Сначала разблокируй Vault: /vault")
+        return
+
+    new_code = crypto.generate_recovery_code()
+    new_salt = crypto.generate_salt()
+    new_hash = crypto.hash_recovery_code(new_code, new_salt)
+    await db.set_recovery_code(user_id, new_hash, new_salt)
+
+    await message.answer(
+        "🔄 <b>Recovery-код обновлён</b>\n\n"
+        f"<code>{new_code}</code>\n\n"
+        "⚠️ Сохрани его. Показывается <b>один раз</b>.\n"
+        "Старый код больше не работает."
+    )
+
+
 def _detect_type(message: Message) -> str | None:
     if message.photo:
         return "photo"
@@ -418,10 +457,6 @@ def _detect_type(message: Message) -> str | None:
 
 
 async def save_content(message: Message, state: FSMContext) -> None:
-    """
-    Сохраняет контент, удаляет исходное сообщение пользователя.
-    Работает только при разблокированном Vault.
-    """
     user_id = message.from_user.id
 
     if message.text and message.text.startswith("/"):
@@ -484,13 +519,11 @@ async def save_content(message: Message, state: FSMContext) -> None:
         "video": "🎥", "document": "📄", "audio": "🎵",
     }.get(content_type, "✅")
 
-    # Удаляем сообщение пользователя
     try:
         await message.delete()
     except Exception:
         pass
 
-    # Отправляем короткое подтверждение и удаляем через 3 секунды
     confirm = await message.answer(f"{emoji} Сохранено.")
     await asyncio.sleep(3)
     try:
@@ -500,10 +533,6 @@ async def save_content(message: Message, state: FSMContext) -> None:
 
 
 async def _send_media_items(message: Message, user_id: int, content_type: str) -> None:
-    """
-    Отправляет все фото/видео пользователя.
-    Через MEDIA_AUTODELETE_SECONDS секунд удаляет всё, что отправил.
-    """
     items = await db.get_items(user_id, content_type=content_type, limit=20)
 
     if not items:
@@ -545,7 +574,6 @@ async def _send_media_items(message: Message, user_id: int, content_type: str) -
         except Exception as e:
             logger.warning("Failed to send file_id: %s", e)
 
-    # Ждём N секунд и удаляем всё
     await asyncio.sleep(MEDIA_AUTODELETE_SECONDS)
 
     for m in sent_messages:
@@ -556,11 +584,6 @@ async def _send_media_items(message: Message, user_id: int, content_type: str) -
 
 
 async def cb_category(callback: CallbackQuery, state: FSMContext) -> None:
-    """
-    Показывает элементы по категории.
-    Для photo/video - отправляет сами файлы с автоудалением.
-    Для остальных - показывает список.
-    """
     user_id = callback.from_user.id
     if not _is_unlocked(user_id):
         await callback.answer("🔒 Vault заблокирован", show_alert=True)
@@ -622,52 +645,4 @@ async def do_search(message: Message, state: FSMContext) -> None:
         return
 
     items = await db.get_items(user_id, content_type=None, limit=200)
-    found = [it for it in items if query in (it["preview"] or "").lower()]
-
-    if not found:
-        await message.answer("📭 Ничего не найдено.")
-    else:
-        lines = ["<b>🔎 Результаты:</b>\n"]
-        for it in found[:20]:
-            dt = it["created_at"][:16].replace("T", " ")
-            preview = (it["preview"] or "")[:60]
-            lines.append(f"<code>#{it['id']}</code> {dt}\n{preview}")
-        await message.answer("\n\n".join(lines))
-
-    await state.clear()
-
-
-async def cb_settings(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await callback.message.edit_text(
-        "⚙️ <b>Настройки</b>\n\n"
-        f"⏱ Время сессии: {SESSION_TTL} мин.\n"
-        f"🔑 2FA: включена\n"
-        f"⏳ Автоудаление медиа: {MEDIA_AUTODELETE_SECONDS} сек.\n\n"
-        "Смена пароля и другие настройки - в следующих версиях.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
-        ]),
-    )
-
-
-def register_handlers(dp: Dispatcher) -> None:
-    dp.message.register(cmd_start, Command("start"))
-    dp.message.register(cmd_vault, Command("vault"))
-    dp.message.register(cmd_lock, Command("lock"))
-
-    dp.callback_query.register(cb_unlock, F.data == "unlock")
-    dp.callback_query.register(cb_menu, F.data == "menu")
-    dp.callback_query.register(cb_lock, F.data == "lock")
-    dp.callback_query.register(cb_settings, F.data == "settings")
-    dp.callback_query.register(cb_search, F.data == "search")
-    dp.callback_query.register(cb_category, F.data.startswith("cat:"))
-
-    dp.message.register(confirm_password, Auth.waiting_confirm_password)
-    dp.message.register(set_new_password, Auth.waiting_new_password)
-    dp.message.register(verify_totp_setup, Auth.waiting_totp_setup)
-    dp.message.register(enter_totp, Auth.waiting_totp)
-    dp.message.register(enter_password, Auth.waiting_password)
-    dp.message.register(do_search, Auth.waiting_search)
-
-    dp.message.register(save_content)
+    found = [it for it in items if query in (it["preview"] or "").
