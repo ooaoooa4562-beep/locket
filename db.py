@@ -13,15 +13,15 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id         INTEGER PRIMARY KEY,
-            username        TEXT,
-            password_hash   TEXT,
-            password_salt   TEXT,
-            totp_secret_enc TEXT,
-            totp_secret_iv  TEXT,
-            totp_enabled    INTEGER DEFAULT 0,
-            created_at      TEXT NOT NULL,
-            last_login_at   TEXT
+            user_id             INTEGER PRIMARY KEY,
+            username            TEXT,
+            password_hash       TEXT,
+            password_salt       TEXT,
+            recovery_code_hash  TEXT,
+            recovery_code_salt  TEXT,
+            code_issued_at      TEXT,
+            created_at          TEXT NOT NULL,
+            last_login_at       TEXT
         );
 
         CREATE TABLE IF NOT EXISTS items (
@@ -82,12 +82,13 @@ async def set_password(user_id: int, password_hash: str, salt: str) -> None:
         await db.commit()
 
 
-async def set_totp_secret(user_id: int, secret_enc: str, iv: str) -> None:
+async def set_recovery_code(user_id: int, code_hash: str, salt: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET totp_secret_enc = ?, totp_secret_iv = ?, totp_enabled = 1 "
-            "WHERE user_id = ?",
-            (secret_enc, iv, user_id),
+            "UPDATE users SET recovery_code_hash = ?, recovery_code_salt = ?, "
+            "code_issued_at = ? WHERE user_id = ?",
+            (code_hash, salt, now, user_id),
         )
         await db.commit()
 
