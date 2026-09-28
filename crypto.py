@@ -1,5 +1,5 @@
 # crypto.py - вся криптография проекта.
-# Argon2id для пароля и ключа, AES-256-GCM для шифрования, TOTP для 2FA.
+# Argon2id для пароля и кода, AES-256-GCM для шифрования.
 
 import os
 import base64
@@ -7,7 +7,6 @@ import secrets
 
 from argon2.low_level import hash_secret_raw, Type
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import pyotp
 
 # Параметры Argon2id
 ARGON2_TIME_COST = 3
@@ -15,6 +14,10 @@ ARGON2_MEMORY_COST = 64 * 1024
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 32
 ARGON2_SALT_LEN = 16
+
+# Алфавит для recovery-кода (без 0, o, 1, i, l, 5, 8, b - похожих символов)
+CODE_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
+CODE_LENGTH = 10
 
 
 def generate_salt() -> str:
@@ -67,24 +70,6 @@ def decrypt(key: bytes, ciphertext_b64: str, iv_b64: str) -> str:
     return pt.decode("utf-8")
 
 
-def generate_totp_secret() -> str:
-    return pyotp.random_base32()
-
-
-def get_totp_uri(secret: str, user_id: int, issuer: str = "Locket") -> str:
-    return pyotp.TOTP(secret).provisioning_uri(
-        name=f"user_{user_id}",
-        issuer_name=issuer,
-    )
-
-
-def verify_totp(secret: str, code: str, valid_window: int = 1) -> bool:
-    try:
-        return pyotp.TOTP(secret).verify(code, valid_window=valid_window)
-    except Exception:
-        return False
-
-
 def derive_data_key(master_key: bytes) -> bytes:
     return hash_secret_raw(
         secret=master_key,
@@ -95,3 +80,42 @@ def derive_data_key(master_key: bytes) -> bytes:
         hash_len=32,
         type=Type.ID,
     )
+
+
+# === Recovery-код ===
+
+def generate_recovery_code() -> str:
+    """
+    Генерирует 10-символьный код из алфавита без похожих символов.
+    Возвращает в формате xxxx-xxxx-xx (для читаемости).
+    """
+    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def normalize_recovery_code(code: str) -> str:
+    """
+    Приводит код к нормальному виду: убирает дефисы/пробелы, нижний регистр.
+    Используется при проверке, чтобы пользователь мог вводить по-разному.
+    """
+    return "".join(c for c in code.lower() if c.isalnum())
+
+
+def hash_recovery_code(code: str, salt_hex: str) -> str:
+    """
+    Хеширует код через Argon2id. Возвращает hex.
+    Перед хешированием нормализует (убирает дефисы, нижний регистр).
+    """
+    normalized = normalize_recovery_code(code)
+    return derive_key(normalized, salt_hex).hex()
+
+
+def verify_recovery_code(code: str, salt_hex: str, stored_hash: str) -> bool:
+    """
+    Проверяет recovery-код. Constant-time сравнение.
+    """
+    try:
+        candidate = hash_recovery_code(code, salt_hex)
+        return secrets.compare_digest(candidate, stored_hash)
+    except Exception:
+        return False
